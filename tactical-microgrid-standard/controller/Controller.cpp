@@ -1,5 +1,6 @@
 #include "Controller.h"
 #include "ActiveMicrogridControllerStateDataReaderListenerImpl.h"
+#include "EnergyStartStopStateDataReaderListenerImpl.h"
 
 #include <common/Utils.h>
 #include <common/QosHelper.h>
@@ -29,8 +30,11 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
 
   DDS::DomainParticipant_var dp = get_domain_participant();
 
-  // Subscribe to the tms::ActiveMicrogridControllerState topic
-  tms::ActiveMicrogridControllerStateTypeSupport_var amcs_ts = new tms::ActiveMicrogridControllerStateTypeSupportImpl;
+  // ---------------------------------------------------------------------------
+  // 1. Subscribe to ActiveMicrogridControllerState (Default Partition)
+  // ---------------------------------------------------------------------------
+  tms::ActiveMicrogridControllerStateTypeSupport_var amcs_ts =
+    new tms::ActiveMicrogridControllerStateTypeSupportImpl;
   if (DDS::RETCODE_OK != amcs_ts->register_type(dp, "")) {
     ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: register_type ActiveMicrogridControllerState failed\n"));
     return DDS::RETCODE_ERROR;
@@ -57,7 +61,8 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
     return DDS::RETCODE_ERROR;
   }
 
-  const DDS::DataReaderQos& amcs_dr_qos = Qos::DataReader::fn_map.at(tms::topic::TOPIC_ACTIVE_MICROGRID_CONTROLLER_STATE)(device_id_);
+  const DDS::DataReaderQos& amcs_dr_qos =
+    Qos::DataReader::fn_map.at(tms::topic::TOPIC_ACTIVE_MICROGRID_CONTROLLER_STATE)(device_id_);
   DDS::DataReaderListener_var amcs_listener(new ActiveMicrogridControllerStateDataReaderListenerImpl(*this));
   DDS::DataReader_var amcs_dr_base = tms_sub->create_datareader(amcs_topic,
                                                                 amcs_dr_qos,
@@ -66,6 +71,61 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
   if (!amcs_dr_base) {
     ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: create_datareader for topic \"%C\" failed\n",
                tms::topic::TOPIC_ACTIVE_MICROGRID_CONTROLLER_STATE.c_str()));
+    return DDS::RETCODE_ERROR;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. Subscribe to EnergyStartStopState (Multi-Partition: "*" and "")
+  // ---------------------------------------------------------------------------
+  tms::EnergyStartStopStateTypeSupport_var esss_ts =
+    new tms::EnergyStartStopStateTypeSupportImpl;
+  if (DDS::RETCODE_OK != esss_ts->register_type(dp, "")) {
+    ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: register_type EnergyStartStopState failed\n"));
+    return DDS::RETCODE_ERROR;
+  }
+
+  CORBA::String_var esss_type_name = esss_ts->get_type_name();
+  DDS::Topic_var esss_topic = dp->create_topic(tms::topic::TOPIC_ENERGY_START_STOP_STATE.c_str(),
+                                               esss_type_name,
+                                               TOPIC_QOS_DEFAULT,
+                                               nullptr,
+                                               ::OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+  if (!esss_topic) {
+    ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: create_topic \"%C\" failed\n",
+               tms::topic::TOPIC_ENERGY_START_STOP_STATE.c_str()));
+    return DDS::RETCODE_ERROR;
+  }
+
+  DDS::SubscriberQos esss_sub_qos;
+  dp->get_default_subscriber_qos(esss_sub_qos);
+  esss_sub_qos.partition.name.length(2);
+  esss_sub_qos.partition.name[0] = "*"; // Matches scoped device partitions
+  esss_sub_qos.partition.name[1] = "";  // Matches default partition
+
+  DDS::Subscriber_var esss_sub = dp->create_subscriber(esss_sub_qos,
+                                                       nullptr,
+                                                       ::OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+  if (!esss_sub) {
+    ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: create_subscriber for EnergyStartStopState failed\n"));
+    return DDS::RETCODE_ERROR;
+  }
+
+  // Standard MIL-STD-3071 PublishLast QoS Profile (Transient Local, Reliable, Depth 1)
+  DDS::DataReaderQos esss_dr_qos;
+  esss_sub->get_default_datareader_qos(esss_dr_qos);
+  esss_dr_qos.durability.kind = DDS::TRANSIENT_LOCAL_DURABILITY_QOS;
+  esss_dr_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+  esss_dr_qos.history.kind = DDS::KEEP_LAST_HISTORY_QOS;
+  esss_dr_qos.history.depth = 1;
+
+  DDS::DataReaderListener_var esss_listener(new EnergyStartStopStateDataReaderListenerImpl(*this));
+  DDS::DataReader_var esss_dr_base = esss_sub->create_datareader(esss_topic,
+                                                                 esss_dr_qos,
+                                                                 esss_listener,
+                                                                 ::OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+  if (!esss_dr_base) {
+    ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: create_datareader for topic \"%C\" failed\n",
+               tms::topic::TOPIC_ENERGY_START_STOP_STATE.c_str()));
     return DDS::RETCODE_ERROR;
   }
 
@@ -119,6 +179,7 @@ PowerDevices Controller::power_devices() const
 void Controller::update_essl(const tms::Identity& pd_id, tms::EnergyStartStopLevel to_level)
 {
   std::lock_guard<std::mutex> guard(mut_);
+  cached_essl_[pd_id] = to_level;
   auto it = power_devices_.find(pd_id);
   if (it != power_devices_.end()) {
     it->second.essl() = to_level;
@@ -136,12 +197,25 @@ void Controller::device_info_cb(const tms::DeviceInfo& di, const DDS::SampleInfo
     ACE_DEBUG((LM_DEBUG, "(%P|%t) Controller::device_info_cb: device: \"%C\"\n", di.deviceId().c_str()));
   }
 
-  // Ignore other control devices, such as microgrid controllers.
-  // Store all power devices, including those that select a different MC as its active MC.
   if (di.role() != tms::DeviceRole::ROLE_MICROGRID_CONTROLLER) {
-    power_devices_.insert(std::make_pair(di.deviceId(),
-                                         cli::PowerDeviceInfo(di, tms::EnergyStartStopLevel::ESSL_OPERATIONAL,
-                                                              std::optional<tms::Identity>())));
+    // Determine initial level: check if a state sample arrived prior to DeviceInfo
+    tms::EnergyStartStopLevel initial_level = tms::EnergyStartStopLevel::ESSL_OFF;
+    auto essl_it = cached_essl_.find(di.deviceId());
+    if (essl_it != cached_essl_.end()) {
+      initial_level = essl_it->second;
+    }
+
+    auto it = power_devices_.find(di.deviceId());
+    if (it == power_devices_.end()) {
+      power_devices_.insert(std::make_pair(di.deviceId(),
+                                           cli::PowerDeviceInfo(di, initial_level,
+                                                                std::optional<tms::Identity>())));
+    } else {
+      it->second.device_info() = di;
+      if (essl_it != cached_essl_.end()) {
+        it->second.essl() = essl_it->second;
+      }
+    }
   }
 }
 
@@ -174,7 +248,7 @@ tms::DeviceInfo Controller::populate_device_info() const
   device_info.role() = tms::DeviceRole::ROLE_MICROGRID_CONTROLLER;
   device_info.product() = Utils::get_ProductInfo();
   device_info.topics() = Utils::get_TopicInfo({}, { tms::topic::TOPIC_ENERGY_START_STOP_REQUEST },
-    { tms::topic::TOPIC_OPERATOR_INTENT_REQUEST });
+    { tms::topic::TOPIC_OPERATOR_INTENT_REQUEST, tms::topic::TOPIC_ENERGY_START_STOP_STATE });
 
   tms::ControlServiceInfo csi;
   {
