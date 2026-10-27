@@ -30,11 +30,8 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
 
   DDS::DomainParticipant_var dp = get_domain_participant();
 
-  // ---------------------------------------------------------------------------
-  // 1. Subscribe to ActiveMicrogridControllerState (Default Partition)
-  // ---------------------------------------------------------------------------
-  tms::ActiveMicrogridControllerStateTypeSupport_var amcs_ts =
-    new tms::ActiveMicrogridControllerStateTypeSupportImpl;
+  // Subscribe to the tms::ActiveMicrogridControllerState topic
+  tms::ActiveMicrogridControllerStateTypeSupport_var amcs_ts = new tms::ActiveMicrogridControllerStateTypeSupportImpl;
   if (DDS::RETCODE_OK != amcs_ts->register_type(dp, "")) {
     ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: register_type ActiveMicrogridControllerState failed\n"));
     return DDS::RETCODE_ERROR;
@@ -61,8 +58,7 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
     return DDS::RETCODE_ERROR;
   }
 
-  const DDS::DataReaderQos& amcs_dr_qos =
-    Qos::DataReader::fn_map.at(tms::topic::TOPIC_ACTIVE_MICROGRID_CONTROLLER_STATE)(device_id_);
+  const DDS::DataReaderQos& amcs_dr_qos = Qos::DataReader::fn_map.at(tms::topic::TOPIC_ACTIVE_MICROGRID_CONTROLLER_STATE)(device_id_);
   DDS::DataReaderListener_var amcs_listener(new ActiveMicrogridControllerStateDataReaderListenerImpl(*this));
   DDS::DataReader_var amcs_dr_base = tms_sub->create_datareader(amcs_topic,
                                                                 amcs_dr_qos,
@@ -74,11 +70,8 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
     return DDS::RETCODE_ERROR;
   }
 
-  // ---------------------------------------------------------------------------
-  // 2. Subscribe to EnergyStartStopState (Multi-Partition: "*" and "")
-  // ---------------------------------------------------------------------------
-  tms::EnergyStartStopStateTypeSupport_var esss_ts =
-    new tms::EnergyStartStopStateTypeSupportImpl;
+  // Subscribe to the tms::EnergyStartStopState topic across device and default partitions
+  tms::EnergyStartStopStateTypeSupport_var esss_ts = new tms::EnergyStartStopStateTypeSupportImpl;
   if (DDS::RETCODE_OK != esss_ts->register_type(dp, "")) {
     ACE_ERROR((LM_ERROR, "(%P|%t) ERROR: Controller::init: register_type EnergyStartStopState failed\n"));
     return DDS::RETCODE_ERROR;
@@ -99,8 +92,8 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
   DDS::SubscriberQos esss_sub_qos;
   dp->get_default_subscriber_qos(esss_sub_qos);
   esss_sub_qos.partition.name.length(2);
-  esss_sub_qos.partition.name[0] = "*"; // Matches scoped device partitions
-  esss_sub_qos.partition.name[1] = "";  // Matches default partition
+  esss_sub_qos.partition.name[0] = "*";
+  esss_sub_qos.partition.name[1] = "";
 
   DDS::Subscriber_var esss_sub = dp->create_subscriber(esss_sub_qos,
                                                        nullptr,
@@ -110,14 +103,7 @@ DDS::ReturnCode_t Controller::init(DDS::DomainId_t domain_id, int argc, char* ar
     return DDS::RETCODE_ERROR;
   }
 
-  // Standard MIL-STD-3071 PublishLast QoS Profile (Transient Local, Reliable, Depth 1)
-  DDS::DataReaderQos esss_dr_qos;
-  esss_sub->get_default_datareader_qos(esss_dr_qos);
-  esss_dr_qos.durability.kind = DDS::TRANSIENT_LOCAL_DURABILITY_QOS;
-  esss_dr_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
-  esss_dr_qos.history.kind = DDS::KEEP_LAST_HISTORY_QOS;
-  esss_dr_qos.history.depth = 1;
-
+  const DDS::DataReaderQos& esss_dr_qos = Qos::DataReader::fn_map.at(tms::topic::TOPIC_ENERGY_START_STOP_STATE)(device_id_);
   DDS::DataReaderListener_var esss_listener(new EnergyStartStopStateDataReaderListenerImpl(*this));
   DDS::DataReader_var esss_dr_base = esss_sub->create_datareader(esss_topic,
                                                                  esss_dr_qos,
@@ -197,8 +183,9 @@ void Controller::device_info_cb(const tms::DeviceInfo& di, const DDS::SampleInfo
     ACE_DEBUG((LM_DEBUG, "(%P|%t) Controller::device_info_cb: device: \"%C\"\n", di.deviceId().c_str()));
   }
 
+  // Ignore other control devices, such as microgrid controllers.
+  // Store all power devices, defaulting to actual physical state (or ESSL_OFF).
   if (di.role() != tms::DeviceRole::ROLE_MICROGRID_CONTROLLER) {
-    // Determine initial level: check if a state sample arrived prior to DeviceInfo
     tms::EnergyStartStopLevel initial_level = tms::EnergyStartStopLevel::ESSL_OFF;
     auto essl_it = cached_essl_.find(di.deviceId());
     if (essl_it != cached_essl_.end()) {

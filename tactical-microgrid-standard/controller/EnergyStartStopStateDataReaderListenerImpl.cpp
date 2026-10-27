@@ -24,7 +24,7 @@ void EnergyStartStopStateDataReaderListenerImpl::on_data_available(DDS::DataRead
   for (CORBA::ULong i = 0; i < data.length(); ++i) {
     if (info_seq[i].valid_data) {
       const tms::Identity& device_id = data[i].deviceId();
-      tms::EnergyStartStopLevel level = data[i].presentLevel();
+      const tms::EnergyStartStopLevel level = data[i].presentLevel();
       controller_.update_essl(device_id, level);
     }
   }
